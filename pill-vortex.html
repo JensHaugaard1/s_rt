@@ -1,0 +1,357 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>SORTx</title>
+<style>
+  html, body { margin: 0; padding: 0; overflow: hidden; background: #090909; height: 100%; }
+  #ascii { display: block; }
+  #ascii canvas { display: block; }
+  #label {
+    position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%);
+    font-family: 'Arial Black', Impact, sans-serif; letter-spacing: 6px;
+    font-size: 13px; color: #eee; opacity: 0.55; pointer-events: none;
+    text-transform: uppercase; z-index: 10;
+  }
+  #logo {
+    position: fixed; bottom: 5vw; left: 50%; transform: translate(-50%, 0%);
+    width: 30vw; max-width: 90vw; pointer-events: none; z-index: 10;
+  }
+</style>
+</head>
+<body>
+<div id="ascii"></div>
+<img id="logo" src="./Asset.svg" alt="SORT" />
+
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+    "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+  }
+}
+</script>
+
+<script type="module">
+import * as THREE from "three";
+import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
+import { EffectComposer } from "three/addons/postprocessing/EffectComposer.js";
+import { RenderPass } from "three/addons/postprocessing/RenderPass.js";
+import { ShaderPass } from "three/addons/postprocessing/ShaderPass.js";
+
+// ---------- basic scene setup ----------
+const scene = new THREE.Scene(); 
+scene.background = new THREE.Color(0xDADBDF); // black — threshold reads off luminance
+
+const camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 200);
+camera.position.set(0, 0, 34);
+
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setPixelRatio(window.devicePixelRatio);
+renderer.setSize(window.innerWidth, window.innerHeight);
+document.getElementById('ascii').appendChild(renderer.domElement);
+
+// ---------- heavy grain threshold post-process ----------
+const grainThresholdShader = {
+  uniforms: {
+    tDiffuse: { value: null },
+    time: { value: 0 },
+    threshold: { value: 0.5 },
+    grainAmount: { value: 0.9 }
+  },
+  vertexShader: /* glsl */ `
+    varying vec2 vUv;
+    void main() {
+      vUv = uv;
+      gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+    }
+  `,
+  fragmentShader: /* glsl */ `
+    uniform sampler2D tDiffuse;
+    uniform float time;
+    uniform float threshold;
+    uniform float grainAmount;
+    varying vec2 vUv;
+
+    float rand(vec2 co) {
+      return fract(sin(dot(co, vec2(12.9898, 78.233))) * 43758.5453123);
+    }
+
+    void main() {
+      vec4 texel = texture2D(tDiffuse, vUv);
+      float lum = dot(texel.rgb, vec3(0.299, 0.587, 0.114));
+
+      // heavy, fast-shifting grain layered on top of luminance before thresholding
+      float grain = rand(vUv * 900.0 + time) - 0.5;
+      float driven = lum + grain * grainAmount;
+
+      float bw = step(threshold, driven);
+      vec3 color = mix(vec3(0.0), vec3(0.909, 0.906, 0.875), bw);
+      gl_FragColor = vec4(color, 1.0);
+    }
+  `
+};
+
+const composer = new EffectComposer(renderer);
+composer.addPass(new RenderPass(scene, camera));
+const grainPass = new ShaderPass(grainThresholdShader);
+grainPass.renderToScreen = true;
+composer.addPass(grainPass);
+composer.setSize(window.innerWidth, window.innerHeight);
+
+// lighting — soft, print-like, mostly flat shading with subtle highlight
+scene.add(new THREE.HemisphereLight(0xffffff, 0x444444, 1.1));
+const key = new THREE.DirectionalLight(0xffffff, 0.9);
+key.position.set(5, 8, 10);
+scene.add(key);
+const rim = new THREE.DirectionalLight(0xffffff, 0.4);
+rim.position.set(-6, -4, -6);
+scene.add(rim);
+
+// ---------- pill geometry (capsule built from cylinder + 2 hemispheres) ----------
+function createPill(radius, length) {
+  const group = new THREE.Group();
+  const material = new THREE.MeshStandardMaterial({
+    color: 0x141414,
+    roughness: 0.45,
+    metalness: 0.05
+  });
+
+  const cyl = new THREE.Mesh(
+    new THREE.CylinderGeometry(radius, radius, length, 20, 1, true),
+    material
+  );
+  group.add(cyl);
+
+  const capGeo = new THREE.SphereGeometry(radius, 20, 12, 0, Math.PI * 2, 0, Math.PI / 2);
+  const capTop = new THREE.Mesh(capGeo, material);
+  capTop.position.y = length / 2;
+  group.add(capTop);
+
+  const capBottom = new THREE.Mesh(capGeo, material);
+  capBottom.rotation.x = Math.PI;
+  capBottom.position.y = -length / 2;
+  group.add(capBottom);
+
+  // thin white seam ring near one end, echoing the two-tone capsule look in the poster
+  const seam = new THREE.Mesh(
+    new THREE.CylinderGeometry(radius * 1.01, radius * 1.01, length * 0.06, 20, 1, true),
+    new THREE.MeshStandardMaterial({ color: 0xf3f1ea, roughness: 0.6 })
+  );
+  seam.position.y = length * 0.12;
+  group.add(seam);
+
+  group.userData.length = length;
+  return group;
+}
+
+// ---------- build the random field ----------
+const pills = [];
+const COUNT = 460;
+const GOLDEN_ANGLE = Math.PI * (3 - Math.sqrt(5));
+const vFOV = THREE.MathUtils.degToRad(camera.fov);
+
+// world-space width/height of the camera frustum at a given z, so the spiral's outer edge reaches the screen corners
+function visibleSizeAtZ(z) {
+  const distance = camera.position.z - z;
+  const height = 2 * Math.tan(vFOV / 2) * distance;
+  const width = height * camera.aspect;
+  return { width, height };
+}
+
+const { width: fieldWidth, height: fieldHeight } = visibleSizeAtZ(-2);
+const maxRadius = Math.sqrt(fieldWidth * fieldWidth + fieldHeight * fieldHeight) / 2; // half-diagonal so pills reach the corners
+
+function vortexPositionScaleRotation(i) {
+  const t = i / COUNT;               // 0 (center) -> 1 (outer edge)
+  const radius = Math.pow(t, 0.62) * maxRadius + maxRadius * 0.03;
+  const angle = i * GOLDEN_ANGLE;
+
+  const x = Math.cos(angle) * radius;
+  const y = Math.sin(angle) * radius;
+  const z = (Math.random() - 0.5) * 6 * t - 2; // slight depth scatter, pulled back at edges
+
+  // pills shrink toward the vortex center, like the poster
+  const scale = (0.5 + t * 1.1) * (0.85 + Math.random() * 0.3) * 0.8;
+
+  // orientation: tangent-ish to the spiral, so they read as being pulled toward the center
+  const swirl = angle + t * 2.4;
+  const rotation = new THREE.Euler(
+    (Math.random() - 0.5) * 0.6,
+    0,
+    swirl + Math.PI / 2
+  );
+
+  return { position: new THREE.Vector3(x, y, z), scale, rotation };
+}
+
+function addPillInstance(template, i) {
+  const pill = template.clone();
+  const { position, scale, rotation } = vortexPositionScaleRotation(i);
+  pill.position.copy(position);
+  pill.scale.setScalar(scale * template.userData.baseScale);
+  pill.rotation.copy(rotation);
+
+  scene.add(pill);
+
+  pills.push({
+    mesh: pill,
+    basePosition: pill.position.clone(),
+    baseQuat: pill.quaternion.clone(),
+    influenceRadius: 8 + Math.random() * 10,
+    phase: Math.random() * Math.PI * 2
+  });
+}
+
+function buildField(template) {
+  for (let i = 0; i < COUNT; i++) addPillInstance(template, i);
+}
+
+// ---------- load the uploaded pill model, fall back to the procedural capsule ----------
+const proceduralTemplate = createPill(0.2, 1.6);
+proceduralTemplate.userData.baseScale = 1;
+
+const loader = new GLTFLoader();
+loader.load(
+  './PILL.glb',
+  (gltf) => {
+    const model = gltf.scene;
+    // normalize scale so the model reads at roughly the same size as the procedural pill
+    const box = new THREE.Box3().setFromObject(model);
+    const sizeVec = new THREE.Vector3();
+    box.getSize(sizeVec);
+    const longestAxis = Math.max(sizeVec.x, sizeVec.y, sizeVec.z) || 1;
+    model.userData.baseScale = 1.8 / longestAxis;
+    buildField(model);
+  },
+  undefined,
+  (err) => {
+    console.warn('Could not load scene.gltf, using procedural pill instead:', err);
+    buildField(proceduralTemplate);
+  } 
+);
+
+// ---------- cursor tracking ----------
+const mouseNDC = new THREE.Vector2(0, 0);
+const raycaster = new THREE.Raycaster();
+const groundPlane = new THREE.Plane(new THREE.Vector3(0, 0, 1), 0); // z = 0 plane facing camera
+const cursorWorld = new THREE.Vector3();
+let hasMouse = false;
+
+window.addEventListener('mousemove', (e) => {
+  mouseNDC.x = (e.clientX / window.innerWidth) * 2 - 1;
+  mouseNDC.y = -(e.clientY / window.innerHeight) * 2 + 1;
+  hasMouse = true;
+});
+
+window.addEventListener('touchmove', (e) => {
+  if (e.touches.length > 0) {
+    const t = e.touches[0];
+    mouseNDC.x = (t.clientX / window.innerWidth) * 2 - 1;
+    mouseNDC.y = -(t.clientY / window.innerHeight) * 2 + 1;
+    hasMouse = true;
+  }
+}, { passive: true });
+
+// ---------- gyro tracking (iOS / mobile) ----------
+// tilt drives a traveling wave through the field instead of acting like a virtual cursor
+const gyroTilt = new THREE.Vector2(0, 0);
+let gyroActive = false;
+
+// gamma: left-right tilt, beta: front-back tilt (offset for a natural ~45° holding angle)
+function onDeviceOrientation(e) {
+  if (e.gamma === null || e.beta === null) return;
+  gyroTilt.x = THREE.MathUtils.clamp(e.gamma / 45, -1, 1);
+  gyroTilt.y = THREE.MathUtils.clamp(-(e.beta - 45) / 45, -1, 1);
+  gyroActive = true;
+}
+
+function enableGyro() {
+  window.addEventListener('deviceorientation', onDeviceOrientation);
+}
+
+// iOS 13+ requires DeviceOrientationEvent.requestPermission() from inside a user gesture
+if (typeof DeviceOrientationEvent !== 'undefined' && typeof DeviceOrientationEvent.requestPermission === 'function') {
+  const requestGyroPermission = () => {
+    DeviceOrientationEvent.requestPermission().then((state) => {
+      if (state === 'granted') enableGyro();
+    }).catch(() => {});
+    window.removeEventListener('touchend', requestGyroPermission);
+    window.removeEventListener('click', requestGyroPermission);
+  };
+  window.addEventListener('touchend', requestGyroPermission, { once: true });
+  window.addEventListener('click', requestGyroPermission, { once: true });
+} else if (window.DeviceOrientationEvent) {
+  enableGyro();
+}
+
+window.addEventListener('resize', () => {
+  camera.aspect = window.innerWidth / window.innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth, window.innerHeight);
+  composer.setSize(window.innerWidth, window.innerHeight);
+});
+
+// ---------- animation loop ----------
+const tmpQuat = new THREE.Quaternion();
+const upAxis = new THREE.Vector3(0, 1, 0);
+const dir = new THREE.Vector3();
+const clock = new THREE.Clock();
+const targetPos = new THREE.Vector3();
+
+function animate() {
+  requestAnimationFrame(animate);
+  const elapsed = clock.getElapsedTime();
+
+  if (hasMouse) {
+    raycaster.setFromCamera(mouseNDC, camera);
+    raycaster.ray.intersectPlane(groundPlane, cursorWorld);
+  }
+
+  for (const p of pills) {
+    const mesh = p.mesh;
+    const base = p.basePosition;
+
+    // gentle idle drift so the field feels alive even without cursor influence
+    const idleWobble = Math.sin(elapsed * 0.6 + p.phase) * 0.05;
+
+    targetPos.copy(base);
+    if (gyroActive) {
+      // tilt sets the wave's direction and amplitude; time keeps it traveling through the field
+      const waveCoord = base.x * gyroTilt.x + base.y * gyroTilt.y;
+      const waveAmp = (Math.abs(gyroTilt.x) + Math.abs(gyroTilt.y)) * 1.5;
+      targetPos.z += Math.sin(waveCoord * 0.5 - elapsed * 2.5) * waveAmp;
+    }
+    mesh.position.lerp(targetPos, 0.08);
+
+    if (hasMouse) {
+      const distXY = mesh.position.distanceTo(new THREE.Vector3(cursorWorld.x, cursorWorld.y, mesh.position.z));
+      const influence = THREE.MathUtils.clamp(1 - distXY / p.influenceRadius, 0, 1);
+
+      dir.copy(cursorWorld).sub(mesh.position).normalize();
+      tmpQuat.setFromUnitVectors(upAxis, dir);
+
+      // blend between the pill's resting orientation and "looking" at the cursor
+      const targetQuat = p.baseQuat.clone().slerp(tmpQuat, influence * 0.9);
+      mesh.quaternion.slerp(targetQuat, 0.08);
+    } else {
+      mesh.quaternion.slerp(p.baseQuat, 0.05);
+    }
+
+    mesh.rotation.z += idleWobble * 0.01;
+  }
+
+  // very subtle whole-scene parallax with the cursor
+  if (hasMouse) {
+    scene.rotation.y += (mouseNDC.x * 0.15 - scene.rotation.y) * 0.02;
+    scene.rotation.x += (-mouseNDC.y * 0.1 - scene.rotation.x) * 0.02;
+  }
+
+  grainPass.uniforms.time.value = elapsed * 60.0; // whole-frame jumps keep the grain harsh, not smooth
+  composer.render();
+}
+
+animate();
+</script>
+</body>
+</html>

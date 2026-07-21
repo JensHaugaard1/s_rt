@@ -17,11 +17,18 @@
     position: fixed; bottom: 5vw; left: 50%; transform: translate(-50%, 0%);
     width: 30vw; max-width: 90vw; pointer-events: none; z-index: 10;
   }
+  #gyroDebug {
+    position: fixed; top: 12px; left: 12px; z-index: 20;
+    font-family: monospace; font-size: 11px; color: #0f0;
+    background: rgba(0,0,0,0.6); padding: 6px 8px; white-space: pre;
+    pointer-events: none;
+  }
 </style>
 </head>
 <body>
 <div id="ascii"></div>
 <img id="logo" src="./Asset.svg" alt="SORT" />
+<div id="gyroDebug">gyro: tap screen to request</div>
 
 <script type="importmap">
 {
@@ -259,30 +266,51 @@ const gyroTilt = new THREE.Vector2(0, 0);
 let gyroActive = false;
 
 // gamma: left-right tilt, beta: front-back tilt (offset for a natural ~45° holding angle)
+const gyroDebugEl = document.getElementById('gyroDebug');
+let orientationEventCount = 0;
 function onDeviceOrientation(e) {
-  if (e.gamma === null || e.beta === null) return;
+  orientationEventCount++;
+  if (e.gamma === null || e.beta === null) {
+    gyroDebugEl.textContent = `gyro: events firing (${orientationEventCount}) but gamma/beta are null`;
+    return;
+  }
   gyroTilt.x = THREE.MathUtils.clamp(e.gamma / 45, -1, 1);
   gyroTilt.y = THREE.MathUtils.clamp(-(e.beta - 45) / 45, -1, 1);
   gyroActive = true;
+  gyroDebugEl.textContent = `gyro: ACTIVE  gamma=${e.gamma.toFixed(1)} beta=${e.beta.toFixed(1)}`;
 }
 
 function enableGyro() {
   window.addEventListener('deviceorientation', onDeviceOrientation);
+  gyroDebugEl.textContent = 'gyro: listener attached, waiting for events...';
+  setTimeout(() => {
+    if (orientationEventCount === 0) {
+      gyroDebugEl.textContent = 'gyro: listener attached but NO events received after 2s';
+    }
+  }, 2000);
 }
 
 // iOS 13+ requires DeviceOrientationEvent.requestPermission() from inside a user gesture
 if (typeof DeviceOrientationEvent !== 'undefined' && typeof DeviceOrientationEvent.requestPermission === 'function') {
+  gyroDebugEl.textContent = 'gyro: iOS permission API detected, tap/click to request';
   const requestGyroPermission = () => {
+    gyroDebugEl.textContent = 'gyro: requesting permission...';
     DeviceOrientationEvent.requestPermission().then((state) => {
+      gyroDebugEl.textContent = `gyro: permission result = "${state}"`;
       if (state === 'granted') enableGyro();
-    }).catch(() => {});
+    }).catch((err) => {
+      gyroDebugEl.textContent = `gyro: permission error - ${err.message || err}`;
+    });
     window.removeEventListener('touchend', requestGyroPermission);
     window.removeEventListener('click', requestGyroPermission);
   };
   window.addEventListener('touchend', requestGyroPermission, { once: true });
   window.addEventListener('click', requestGyroPermission, { once: true });
 } else if (window.DeviceOrientationEvent) {
+  gyroDebugEl.textContent = 'gyro: no permission API needed, attaching listener';
   enableGyro();
+} else {
+  gyroDebugEl.textContent = 'gyro: DeviceOrientationEvent not supported';
 }
 
 window.addEventListener('resize', () => {
